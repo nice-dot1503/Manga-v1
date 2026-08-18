@@ -1,0 +1,379 @@
+// ============================================================================
+// MANGA READER PLATFORM — DATABASE SCHEMA
+// PostgreSQL via Prisma. Images are NEVER stored as binary here — only
+// metadata/path/hash. Actual image bytes live in Cloudflare R2.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// AUTH / USERS
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  ADMIN
+  EDITOR
+  MODERATOR
+  USER
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  username     String   @unique
+  passwordHash String // Argon2id hash — never plaintext, never reversible
+  role         UserRole @default(USER)
+  isBanned     Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sessions        Session[]
+  favorites       Favorite[]
+  readingHistory  ReadingHistory[]
+  comments        Comment[]
+  auditLogs       AuditLog[]
+  uploadedChapters Chapter[] @relation("ChapterUploadedBy")
+
+  @@index([role])
+  @@index([email])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash    String   @unique // hash of the session token, not the raw token
+  ipAddress    String?
+  userAgent    String?
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------------------
+// MANGA / CHAPTERS / PAGES
+// ---------------------------------------------------------------------------
+
+enum MangaStatus {
+  ONGOING
+  COMPLETED
+  HIATUS
+  DROPPED
+  DRAFT // not yet published
+}
+
+model Manga {
+  id               String      @id @default(cuid())
+  slug             String      @unique
+  title            String
+  alternativeTitles String[]   @default([])
+  description      String?
+  author           String?
+  artist           String?
+  coverImagePath   String? // R2 object key
+  status           MangaStatus @default(DRAFT)
+  copyrightHolder  String?
+  licenseInfo      String?
+  source           String?
+  viewCount        Int         @default(0)
+  ratingSum        Int         @default(0)
+  ratingCount      Int         @default(0)
+  isPublished      Boolean     @default(false)
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  genres         MangaGenre[]
+  chapters       Chapter[]
+  favorites      Favorite[]
+  readingHistory ReadingHistory[]
+  comments       Comment[]
+
+  @@index([status])
+  @@index([isPublished])
+  @@index([title])
+}
+
+model Genre {
+  id    String       @id @default(cuid())
+  name  String       @unique
+  slug  String       @unique
+  manga MangaGenre[]
+}
+
+model MangaGenre {
+  mangaId String
+  genreId String
+  manga   Manga @relation(fields: [mangaId], references: [id], onDelete: Cascade)
+  genre   Genre @relation(fields: [genreId], references: [id], onDelete: Cascade)
+
+  @@id([mangaId, genreId])
+  @@index([genreId])
+}
+
+enum ChapterUploadStatus {
+  PENDING_REVIEW // preview stage — admin has not confirmed page order/gaps yet
+  PUBLISHED
+  UNPUBLISHED
+  ARCHIVED
+}
+
+model Chapter {
+  id             String              @id @default(cuid())
+  mangaId        String
+  manga          Manga               @relation(fields: [mangaId], references: [id], onDelete: Cascade)
+  chapterNumber  Float // supports 10.5-style chapters
+  title          String?
+  uploadStatus   ChapterUploadStatus @default(PENDING_REVIEW)
+  strictMode     Boolean             @default(true) // Strict vs Flexible upload mode (section 10)
+  uploadedById   String?
+  uploadedBy     User?               @relation("ChapterUploadedBy", fields: [uploadedById], references: [id])
+  publishedAt    DateTime?
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  pages          Page[]
+  readingHistory ReadingHistory[]
+  comments       Comment[]
+
+  @@unique([mangaId, chapterNumber])
+  @@index([mangaId])
+  @@index([uploadStatus])
+}
+
+model Page {
+  id            String   @id @default(cuid())
+  chapterId     String
+  chapter       Chapter  @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+  pageNumber    Int // logical, sequential, gap-free after admin confirmation
+  originalFilename String
+  storagePath   String // R2 object key for the optimized image
+  thumbnailPath String? // R2 object key for the thumbnail
+  width         Int?
+  height        Int?
+  sizeBytes     Int
+  mimeType      String
+  createdAt     DateTime @default(now())
+
+  hash PageHash?
+
+  @@unique([chapterId, pageNumber])
+  @@index([chapterId])
+}
+
+// SHA-256 (exact) and perceptual hash (visual near-duplicate) live together
+// so both duplicate-detection strategies query from a single indexed table.
+model PageHash {
+  id            String  @id @default(cuid())
+  pageId        String  @unique
+  page          Page    @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  sha256        String // exact-duplicate detection
+  perceptualHash String // pHash/dHash, for visual near-duplicate detection
+
+  @@index([sha256])
+  @@index([perceptualHash])
+}
+
+// ---------------------------------------------------------------------------
+// USER INTERACTION
+// ---------------------------------------------------------------------------
+
+model ReadingHistory {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  mangaId     String
+  manga       Manga    @relation(fields: [mangaId], references: [id], onDelete: Cascade)
+  chapterId   String
+  chapter     Chapter  @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+  lastPage    Int      @default(1)
+  updatedAt   DateTime @updatedAt
+
+  @@unique([userId, mangaId])
+  @@index([userId])
+}
+
+model Favorite {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  mangaId   String
+  manga     Manga    @relation(fields: [mangaId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, mangaId])
+  @@index([mangaId])
+}
+
+model Comment {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  mangaId   String?
+  manga     Manga?   @relation(fields: [mangaId], references: [id], onDelete: Cascade)
+  chapterId String?
+  chapter   Chapter? @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+  body      String
+  isRemoved Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([mangaId])
+  @@index([chapterId])
+}
+
+// ---------------------------------------------------------------------------
+// ADVERTISEMENT
+// ---------------------------------------------------------------------------
+
+enum AdPlacement {
+  HOME_TOP
+  HOME_MIDDLE
+  HOME_SIDEBAR
+  MANGA_TOP
+  MANGA_BOTTOM
+  READER_TOP
+  READER_BOTTOM
+}
+
+enum CampaignStatus {
+  DRAFT
+  PENDING_PAYMENT
+  SCHEDULED
+  ACTIVE
+  PAUSED
+  ENDED
+  REJECTED
+}
+
+model Advertiser {
+  id           String   @id @default(cuid())
+  companyName  String
+  contactName  String
+  email        String
+  website      String?
+  createdAt    DateTime @default(now())
+
+  campaigns Campaign[]
+
+  @@index([email])
+}
+
+model Campaign {
+  id              String         @id @default(cuid())
+  advertiserId    String
+  advertiser      Advertiser     @relation(fields: [advertiserId], references: [id], onDelete: Cascade)
+  name            String
+  placement       AdPlacement
+  imagePath       String // R2 object key
+  destinationUrl  String
+  status          CampaignStatus @default(DRAFT)
+  priority        Int            @default(0)
+  startDate       DateTime
+  endDate         DateTime
+  impressionLimit Int?
+  clickLimit      Int?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  impressions AdImpression[]
+  clicks      AdClick[]
+  payment     Payment?
+
+  @@index([status])
+  @@index([placement])
+  @@index([startDate, endDate])
+}
+
+model AdImpression {
+  id           String   @id @default(cuid())
+  campaignId   String
+  campaign     Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  sessionHash  String // hashed session/request identity, for dedup — not raw IP
+  createdAt    DateTime @default(now())
+
+  @@index([campaignId, createdAt])
+  @@index([campaignId, sessionHash])
+}
+
+model AdClick {
+  id           String   @id @default(cuid())
+  campaignId   String
+  campaign     Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  sessionHash  String
+  createdAt    DateTime @default(now())
+
+  @@index([campaignId, createdAt])
+  @@index([campaignId, sessionHash])
+}
+
+// ---------------------------------------------------------------------------
+// PAYMENTS — abstraction layer, provider-agnostic
+// ---------------------------------------------------------------------------
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  EXPIRED
+  REFUNDED
+  CANCELLED
+}
+
+model Payment {
+  id              String        @id @default(cuid())
+  campaignId      String        @unique
+  campaign        Campaign      @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  provider        String // e.g. "stripe", "omise" — never store raw card data
+  providerRef     String? // provider's charge/order id
+  amountCents     Int
+  currency        String        @default("THB")
+  status          PaymentStatus @default(PENDING)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  events PaymentEvent[]
+
+  @@index([status])
+  @@index([providerRef])
+}
+
+// Every webhook / status transition is recorded — never mutate Payment.status
+// without an accompanying PaymentEvent row (audit trail for money).
+model PaymentEvent {
+  id         String   @id @default(cuid())
+  paymentId  String
+  payment    Payment  @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  fromStatus PaymentStatus?
+  toStatus   PaymentStatus
+  source     String // "webhook" | "admin" | "system"
+  rawPayload Json? // verified webhook payload, for dispute resolution
+  createdAt  DateTime @default(now())
+
+  @@index([paymentId])
+}
+
+// ---------------------------------------------------------------------------
+// AUDIT LOG
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String?
+  actor     User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  action    String // e.g. "chapter.publish", "campaign.status_change"
+  targetType String?
+  targetId   String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([actorId])
+  @@index([action, createdAt])
+}
